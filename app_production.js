@@ -5,7 +5,7 @@ const WhatsAppBusinessService = require('./services/services_whatsapp_business')
 const AIService = require('./services/services_aiService_Version2');
 const attendanceService = require('./services/services_attendanceService_Version2'); // Already an instance
 const Student = require('./models/models_Student_Version2');
-const Schedule = require('./models/models_Schedule_Version2');
+const { Schedule, Subject } = require('./models/models_Schedule_Version2');
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -239,8 +239,20 @@ async function handleRegistration(student, phoneNumber, aiResponse) {
     }
 
     if (aiResponse.rollNumber) {
-      student.rollNumber = aiResponse.rollNumber;
-      updated = true;
+      // Check if this roll number already belongs to this student
+      if (student.rollNumber !== aiResponse.rollNumber) {
+        // Check if another student has this roll number
+        const existingStudent = await Student.findOne({ rollNumber: aiResponse.rollNumber });
+        if (existingStudent && existingStudent._id.toString() !== student._id.toString()) {
+          await whatsappService.sendMessage(
+            phoneNumber,
+            '⚠️ This roll number is already registered to another account.\n\nIf this is your roll number, please contact support.'
+          );
+          return;
+        }
+        student.rollNumber = aiResponse.rollNumber;
+        updated = true;
+      }
     }
 
     if (aiResponse.semester) {

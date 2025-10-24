@@ -8,16 +8,26 @@ const StudentSchema = new mongoose.Schema({
   },
   rollNumber: {
     type: String,
-    required: true,
-    unique: true
+    required: false,  // Optional - will be set during registration
+    unique: true,
+    sparse: true  // Allows multiple null values
   },
   name: {
     type: String,
-    required: true
+    required: false,  // Optional - will be set during registration
+    default: 'New User'
   },
   semester: {
     type: Number,
-    required: true
+    required: false  // Optional - will be set during registration
+  },
+  isRegistered: {
+    type: Boolean,
+    default: false
+  },
+  registrationDate: {
+    type: Date,
+    default: Date.now
   },
   subjects: [{
     type: mongoose.Schema.Types.ObjectId,
