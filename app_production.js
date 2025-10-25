@@ -190,6 +190,14 @@ whatsappService.on('message', async (message) => {
 async function handleTextMessage(student, phoneNumber, text, messageId) {
   try {
     console.log('💬 Processing text message...');
+    console.log('📝 User said:', text);
+    
+    // Check if user is responding to image upload prompt
+    const lowerText = text.toLowerCase().trim();
+    if (student.lastImageId && (lowerText.includes('subject list') || lowerText.includes('schedule'))) {
+      await handleImageClassification(student, phoneNumber, text);
+      return;
+    }
     
     // Process with AI
     const aiResponse = await aiService.processConversation(text, {
@@ -206,11 +214,15 @@ async function handleTextMessage(student, phoneNumber, text, messageId) {
         break;
 
       case 'record_attendance':
-        await handleAttendanceRecording(student, phoneNumber, aiResponse);
+        await handleAttendanceRecording(student, phoneNumber, aiResponse, messageId);
         break;
 
       case 'get_summary':
         await handleSummaryRequest(student, phoneNumber);
+        break;
+
+      case 'view_schedule':
+        await handleViewSchedule(student, phoneNumber, aiResponse);
         break;
 
       default:
@@ -292,7 +304,7 @@ async function handleRegistration(student, phoneNumber, aiResponse) {
 /**
  * Handle attendance recording
  */
-async function handleAttendanceRecording(student, phoneNumber, aiResponse) {
+async function handleAttendanceRecording(student, phoneNumber, aiResponse, messageId) {
   try {
     if (!aiResponse.attendanceData) {
       await whatsappService.sendMessage(phoneNumber, aiResponse.message);
@@ -306,10 +318,84 @@ async function handleAttendanceRecording(student, phoneNumber, aiResponse) {
     );
 
     await whatsappService.sendMessage(phoneNumber, aiResponse.message);
-    await whatsappService.sendReaction(phoneNumber, message.id, '✅');
+    
+    // Send reaction if messageId is available
+    if (messageId) {
+      await whatsappService.sendReaction(phoneNumber, messageId, '✅');
+    }
 
   } catch (error) {
     console.error('Error in handleAttendanceRecording:', error);
+    throw error;
+  }
+}
+
+/**
+ * Handle viewing schedule for a specific day
+ */
+async function handleViewSchedule(student, phoneNumber, aiResponse) {
+  try {
+    const requestedDay = aiResponse.day || new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    
+    console.log(`📅 Fetching schedule for ${requestedDay}`);
+    
+    // Get student's schedule
+    const schedule = await Schedule.findOne({ student: student._id }).populate('subjects');
+    
+    if (!schedule) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        '📅 *Schedule Not Found*\n\n' +
+        'You haven\'t uploaded your schedule yet!\n\n' +
+        '📸 Please send a photo of your timetable to get started.'
+      );
+      return;
+    }
+    
+    // Filter time slots for the requested day
+    const daySlots = schedule.timeSlots.filter(slot => slot.day === requestedDay);
+    
+    if (daySlots.length === 0) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `📅 *${requestedDay}'s Schedule*\n\n` +
+        `🎉 No classes scheduled for ${requestedDay}!\n\n` +
+        `Enjoy your day off! 😊`
+      );
+      return;
+    }
+    
+    // Sort slots by start time
+    daySlots.sort((a, b) => {
+      const timeA = a.startTime.split(':').map(Number);
+      const timeB = b.startTime.split(':').map(Number);
+      return timeA[0] * 60 + timeA[1] - (timeB[0] * 60 + timeB[1]);
+    });
+    
+    // Build schedule message
+    let message = `📅 *${requestedDay}'s Schedule*\n\n`;
+    message += `You have ${daySlots.length} class${daySlots.length > 1 ? 'es' : ''} today:\n\n`;
+    
+    for (const slot of daySlots) {
+      // Find the subject details from the populated subjects array
+      const subject = schedule.subjects.find(s => s._id.toString() === slot.subject.toString());
+      
+      if (subject) {
+        message += `🕐 *${slot.startTime} - ${slot.endTime}*\n`;
+        message += `   📚 ${subject.code} - ${subject.name}\n\n`;
+      }
+    }
+    
+    message += `\n💡 Don't forget to mark your attendance after classes!`;
+    
+    await whatsappService.sendMessage(phoneNumber, message);
+    
+  } catch (error) {
+    console.error('Error in handleViewSchedule:', error);
+    await whatsappService.sendMessage(
+      phoneNumber,
+      '😔 Sorry, I had trouble fetching your schedule.\n\nPlease try again!'
+    );
     throw error;
   }
 }
@@ -321,12 +407,13 @@ async function handleSummaryRequest(student, phoneNumber) {
   try {
     const summary = await attendanceService.getAttendanceSummary(student._id);
     
-    if (!summary || summary.length === 0) {
+    if (!summary || !summary.subjects || summary.subjects.length === 0) {
       await whatsappService.sendMessage(
         phoneNumber,
         '📊 *Attendance Summary*\n\n' +
         'No attendance records found yet.\n\n' +
-        'Start reporting your attendance by telling me which classes you attended!\n\n' +
+        '📸 *First Step:* Upload your class schedule by sending a photo of your timetable.\n\n' +
+        '📝 *Then:* Start reporting your attendance by telling me which classes you attended!\n\n' +
         '💡 Example: "I attended Math and Physics today"'
       );
       return;
@@ -335,17 +422,18 @@ async function handleSummaryRequest(student, phoneNumber) {
     // Format summary message
     let message = '📊 *Your Attendance Summary*\n\n';
     
-    summary.forEach(subject => {
-      const percentage = subject.totalClasses > 0 
-        ? ((subject.present / subject.totalClasses) * 100).toFixed(1)
+    summary.subjects.forEach(subject => {
+      const percentage = subject.total > 0 
+        ? ((subject.present / subject.total) * 100).toFixed(1)
         : 0;
       
       const emoji = percentage >= 75 ? '✅' : percentage >= 50 ? '⚠️' : '❌';
       
-      message += `${emoji} *${subject.subjectName}*\n`;
-      message += `   Present: ${subject.present}/${subject.totalClasses} (${percentage}%)\n\n`;
+      message += `${emoji} *${subject.name}* (${subject.code})\n`;
+      message += `   Present: ${subject.present}/${subject.total} (${percentage}%)\n\n`;
     });
 
+    message += `\n📈 *Overall:* ${summary.overall.present}/${summary.overall.total} (${summary.overall.percentage}%)\n`;
     message += '\n💡 *Note:* You need 75% attendance to avoid issues!';
 
     await whatsappService.sendMessage(phoneNumber, message);
@@ -357,27 +445,266 @@ async function handleSummaryRequest(student, phoneNumber) {
 }
 
 /**
+ * Handle image classification (subject list vs schedule)
+ */
+async function handleImageClassification(student, phoneNumber, text) {
+  try {
+    const lowerText = text.toLowerCase().trim();
+    
+    if (!student.uploadState) {
+      student.uploadState = {
+        subjectListImageId: null,
+        scheduleImageId: null
+      };
+    }
+    
+    if (lowerText.includes('subject list')) {
+      student.uploadState.subjectListImageId = student.lastImageId;
+      student.lastImageId = null;
+      await student.save();
+      
+      await whatsappService.sendMessage(
+        phoneNumber,
+        '✅ Subject list image saved!\n\n' +
+        '📸 Now send your timetable/schedule image and reply "schedule"'
+      );
+      
+    } else if (lowerText.includes('schedule')) {
+      student.uploadState.scheduleImageId = student.lastImageId;
+      student.lastImageId = null;
+      await student.save();
+      
+      // Check if we have both images
+      if (student.uploadState.subjectListImageId && student.uploadState.scheduleImageId) {
+        await processCompleteSchedule(student, phoneNumber);
+      } else {
+        await whatsappService.sendMessage(
+          phoneNumber,
+          '✅ Schedule image saved!\n\n' +
+          '📸 Now send your subject list image and reply "subject list"'
+        );
+      }
+    }
+    
+  } catch (error) {
+    console.error('Error in handleImageClassification:', error);
+    throw error;
+  }
+}
+
+/**
+ * Process complete schedule once both images are uploaded
+ */
+async function processCompleteSchedule(student, phoneNumber) {
+  try {
+    await whatsappService.sendMessage(
+      phoneNumber,
+      '🎉 Both images received!\n\n' +
+      '🤖 Using AI Vision to extract your schedule...\n\n' +
+      'This may take 10-20 seconds. Please wait! ⏳'
+    );
+    
+    // Get WhatsApp media URLs for both images
+    const subjectListUrl = await whatsappService.getMediaUrl(student.uploadState.subjectListImageId);
+    const scheduleUrl = await whatsappService.getMediaUrl(student.uploadState.scheduleImageId);
+    
+    console.log('📸 Extracting subject list from image...');
+    const subjectsData = await aiService.extractScheduleFromImage(subjectListUrl, 'subject_list');
+    
+    console.log('📸 Extracting timetable from image...');
+    const scheduleData = await aiService.extractScheduleFromImage(scheduleUrl, 'schedule');
+    
+    console.log('✅ GPT Vision Response:');
+    console.log('   Subjects:', JSON.stringify(subjectsData, null, 2));
+    console.log('   Schedule:', JSON.stringify(scheduleData, null, 2));
+    
+    // Validate extracted data
+    if (!subjectsData?.subjects || subjectsData.subjects.length === 0) {
+      throw new Error('No subjects extracted from subject list image');
+    }
+    
+    if (!scheduleData?.schedule || scheduleData.schedule.length === 0) {
+      throw new Error('No schedule data extracted from timetable image');
+    }
+    
+    // Create a map for quick subject code lookup (normalize codes by removing dashes and making uppercase)
+    const normalizeCode = (code) => code.replace(/[-\s]/g, '').toUpperCase();
+    const subjectMap = new Map();
+    subjectsData.subjects.forEach(s => {
+      const normalized = normalizeCode(s.code);
+      subjectMap.set(normalized, s);
+      // Also store with original code
+      subjectMap.set(s.code, s);
+    });
+    
+    console.log('📋 Subject codes available:', Array.from(subjectMap.keys()));
+    
+    // Create schedule in database with subjects as subdocuments
+    const schedule = new Schedule({
+      student: student._id,
+      semester: student.semester || 1,
+      subjects: subjectsData.subjects.map(s => ({
+        code: s.code,
+        name: s.name,
+        totalClasses: 0
+      })),
+      timeSlots: []
+    });
+    
+    // Add time slots from schedule
+    let slotsAdded = 0;
+    let skippedSlots = [];
+    
+    for (const dayData of scheduleData.schedule) {
+      console.log(`\n📅 Processing ${dayData.day}:`, dayData.slots?.length || 0, 'slots');
+      
+      if (!dayData.slots || dayData.slots.length === 0) {
+        console.log(`   ⚠️  No slots found for ${dayData.day}`);
+        continue;
+      }
+      
+      for (const slot of dayData.slots) {
+        // Extract base subject code (remove teacher names, lab groups, etc.)
+        // Examples: "PC209/AH" -> "PC209", "PC253/TBA/ETL312/Grp A" -> "PC253"
+        let baseCode = slot.subjectCode.split('/')[0].trim();
+        
+        // Try to find matching subject using multiple strategies
+        const normalizedSlotCode = normalizeCode(baseCode);
+        
+        // Strategy 1: Exact match with original code
+        let matchingSubject = subjectMap.get(slot.subjectCode);
+        
+        // Strategy 2: Match with base code (before first slash)
+        if (!matchingSubject) {
+          matchingSubject = subjectMap.get(baseCode);
+        }
+        
+        // Strategy 3: Try normalized version
+        if (!matchingSubject) {
+          matchingSubject = subjectMap.get(normalizedSlotCode);
+        }
+        
+        // Strategy 4: Search through all subjects for partial match
+        if (!matchingSubject) {
+          for (const [key, subject] of subjectMap.entries()) {
+            const normalizedKey = normalizeCode(key);
+            if (normalizedKey === normalizedSlotCode || normalizedKey.includes(normalizedSlotCode) || normalizedSlotCode.includes(normalizedKey)) {
+              matchingSubject = subject;
+              console.log(`   🔍 Found match: "${slot.subjectCode}" -> "${subject.code}" via partial match`);
+              break;
+            }
+          }
+        }
+        
+        if (!matchingSubject) {
+          // Try partial match
+          for (const [code, subject] of subjectMap.entries()) {
+            if (normalizeCode(code) === normalizedSlotCode) {
+              matchingSubject = subject;
+              break;
+            }
+          }
+        }
+        
+        if (matchingSubject) {
+          // Find the subject subdocument in schedule.subjects array
+          const subjectSubdoc = schedule.subjects.find(s => 
+            normalizeCode(s.code) === normalizeCode(matchingSubject.code)
+          );
+          
+          if (subjectSubdoc) {
+            schedule.timeSlots.push({
+              day: dayData.day,
+              startTime: slot.startTime,
+              endTime: slot.endTime,
+              subject: subjectSubdoc._id  // Use the subdocument's _id
+            });
+            slotsAdded++;
+            console.log(`   ✅ ${slot.startTime}-${slot.endTime} → ${slot.subjectCode} (matched to ${matchingSubject.code})`);
+          } else {
+            console.log(`   ⚠️  Subdocument not found for ${matchingSubject.code}`);
+            skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode}`);
+          }
+        } else {
+          console.log(`   ❌ No match found for "${slot.subjectCode}"`);
+          skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode}`);
+        }
+      }
+    }
+    
+    console.log(`\n📊 Summary:`);
+    console.log(`   ✅ Slots added: ${slotsAdded}`);
+    console.log(`   ❌ Skipped slots: ${skippedSlots.length}`);
+    if (skippedSlots.length > 0) {
+      console.log(`   Skipped details:`, skippedSlots);
+    }
+    
+    // Save schedule
+    await schedule.save();
+    console.log('✅ Schedule saved to database');
+    
+    // Success message
+    let successMsg = `✅ *Schedule Created Successfully!*\n\n` +
+      `📚 Subjects (${subjectsData.subjects.length}):\n` +
+      subjectsData.subjects.map(s => `• ${s.code} - ${s.name}`).join('\n') +
+      `\n\n📅 Time slots: ${slotsAdded}`;
+    
+    if (skippedSlots.length > 0) {
+      successMsg += `\n⚠️  Skipped ${skippedSlots.length} slots (subject code mismatch)`;
+    }
+    
+    successMsg += `\n\n🎉 You can now start reporting your attendance!\n\n` +
+      `💡 Example: "I attended ${subjectsData.subjects[0]?.code || 'CS101'} and ${subjectsData.subjects[1]?.code || 'MA101'} today"`;
+    
+    await whatsappService.sendMessage(phoneNumber, successMsg);
+    
+    // Clear upload state
+    student.uploadState = null;
+    await student.save();
+    
+  } catch (error) {
+    console.error('❌ Error in processCompleteSchedule:', error);
+    console.error('   Stack:', error.stack);
+    
+    await whatsappService.sendMessage(
+      phoneNumber,
+      '😔 Sorry, I had trouble processing your schedule images.\n\n' +
+      '🔄 Please try uploading again.\n\n' +
+      `Error: ${error.message}`
+    );
+    
+    throw error;
+  }
+}
+
+/**
  * Handle image messages (schedule upload)
  */
 async function handleImageMessage(student, phoneNumber, message) {
   try {
     console.log('📸 Processing schedule image...');
     
+    // Initialize student's upload state if not exists
+    if (!student.uploadState) {
+      student.uploadState = {
+        subjectListImage: null,
+        scheduleImage: null,
+        step: 'waiting_first_image'
+      };
+    }
+
     await whatsappService.sendMessage(
       phoneNumber,
-      '📸 Schedule image received! Processing...\n\n' +
-      'This may take a moment. I\'ll let you know once I\'ve extracted your subjects.'
+      '📸 Image received! Let me know what this is:\n\n' +
+      '1️⃣ Type "subject list" if this contains subject names and codes\n' +
+      '2️⃣ Type "schedule" if this is your timetable with subject codes\n\n' +
+      '💡 I need both images to create your complete schedule!'
     );
 
-    // Note: Image processing requires additional setup
-    // For now, send a placeholder response
-    await whatsappService.sendMessage(
-      phoneNumber,
-      '✅ Schedule uploaded successfully!\n\n' +
-      'You can now start reporting your attendance.\n\n' +
-      '💡 *Example:*\n' +
-      '"I attended Math, Physics, and Computer Science today"'
-    );
+    // Store the image ID temporarily (you'll need to download and process later)
+    student.lastImageId = message.image.id;
+    student.lastImageCaption = message.image.caption || '';
+    await student.save();
 
   } catch (error) {
     console.error('Error in handleImageMessage:', error);

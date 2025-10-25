@@ -175,7 +175,15 @@ class AttendanceService {
         .populate('subjects');
         
       if (!schedule) {
-        throw new Error('Student schedule not found');
+        // Return empty summary if no schedule exists
+        return {
+          overall: {
+            present: 0,
+            total: 0,
+            percentage: 'N/A'
+          },
+          subjects: []
+        };
       }
       
       // Get attendance records

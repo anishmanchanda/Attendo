@@ -264,6 +264,47 @@ class WhatsAppBusinessService extends EventEmitter {
       console.error('⚠️  Error sending reaction:', error.response?.data);
     }
   }
+
+  /**
+   * Get media URL from WhatsApp
+   */
+  async getMediaUrl(mediaId) {
+    try {
+      console.log('📥 Getting media URL for:', mediaId);
+      
+      // First, get media info
+      const infoResponse = await axios({
+        method: 'GET',
+        url: `https://graph.facebook.com/${this.apiVersion}/${mediaId}`,
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`
+        }
+      });
+      
+      const mediaUrl = infoResponse.data.url;
+      console.log('✅ Media URL retrieved');
+      
+      // Download the media to get actual image data
+      const mediaResponse = await axios({
+        method: 'GET',
+        url: mediaUrl,
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`
+        },
+        responseType: 'arraybuffer'
+      });
+      
+      // Convert to base64 for GPT Vision
+      const base64Image = Buffer.from(mediaResponse.data).toString('base64');
+      const mimeType = mediaResponse.headers['content-type'] || 'image/jpeg';
+      
+      return `data:${mimeType};base64,${base64Image}`;
+      
+    } catch (error) {
+      console.error('❌ Error getting media URL:', error.response?.data || error.message);
+      throw error;
+    }
+  }
 }
 
 module.exports = WhatsAppBusinessService;

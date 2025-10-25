@@ -41,6 +41,17 @@ const StudentSchema = new mongoose.Schema({
   tempData: {
     type: mongoose.Schema.Types.Mixed
   },
+  // Image upload tracking
+  lastImageId: {
+    type: String
+  },
+  lastImageCaption: {
+    type: String
+  },
+  uploadState: {
+    subjectListImageId: String,
+    scheduleImageId: String
+  },
   createdAt: {
     type: Date,
     default: Date.now

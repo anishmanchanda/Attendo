@@ -23,6 +23,7 @@ class AIService {
 
               Current student context: ${JSON.stringify(studentContext)}
               Current date: ${new Date().toISOString().split('T')[0]}
+              Current day: ${new Date().toLocaleDateString('en-US', { weekday: 'long' })}
               
               Based on the student's message, decide what action to take and respond appropriately.
               
@@ -30,17 +31,20 @@ class AIService {
               1. "register_student" - when student wants to register
               2. "record_attendance" - when student reports attendance 
               3. "get_summary" - when student wants attendance summary
-              4. "general_conversation" - for any other conversation
+              4. "view_schedule" - when student asks about their schedule/timetable/classes (e.g., "what classes do I have on Monday?", "show my schedule", "what's my timetable?")
+              5. "general_conversation" - for any other conversation
               
               For registration, extract name and roll number from the message.
               For attendance, parse which subjects they attended/missed and create attendance data.
               For summaries, acknowledge the request.
+              For view_schedule, extract the day they're asking about (or use current day if not specified). Set "day" field to: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday.
               For general conversation, be helpful and guide them.
               
               ALWAYS respond in this JSON format:
               {
-                "action": "register_student|record_attendance|get_summary|general_conversation",
+                "action": "register_student|record_attendance|get_summary|view_schedule|general_conversation",
                 "message": "Your conversational response to the student",
+                "day": "Monday|Tuesday|etc (only for view_schedule action)",
                 "name": "extracted name (for registration)",
                 "rollNumber": "extracted roll number (for registration)", 
                 "semester": number (for registration),
@@ -260,6 +264,73 @@ class AIService {
       return JSON.parse(response.data.choices[0].message.content);
     } catch (error) {
       console.error('Error processing attendance query:', error);
+      throw error;
+    }
+  }
+
+  async extractScheduleFromImage(imageUrl, imageType) {
+    try {
+      const prompt = imageType === 'subject_list' 
+        ? `Extract all subjects from this image. Return a JSON object with this format:
+{
+  "subjects": [
+    {"code": "CS101", "name": "Computer Science"},
+    {"code": "MA101", "name": "Mathematics"}
+  ]
+}
+
+Extract ALL subjects you can see. Include both the subject code and full name.`
+        : `Extract the complete class schedule/timetable from this image. Return a JSON object with this format:
+{
+  "schedule": [
+    {
+      "day": "Monday",
+      "slots": [
+        {"startTime": "09:00", "endTime": "10:00", "subjectCode": "CS101"},
+        {"startTime": "10:00", "endTime": "11:00", "subjectCode": "MA101"}
+      ]
+    }
+  ]
+}
+
+Extract ALL time slots for ALL days. Use 24-hour format for times (HH:MM). Use day names: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday.`;
+
+      const response = await axios({
+        method: 'POST',
+        url: 'https://api.openai.com/v1/chat/completions',
+        headers: {
+          'Authorization': `Bearer ${this.openaiApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        data: {
+          model: "gpt-4o",
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: prompt
+                },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: imageUrl,
+                    detail: "high"
+                  }
+                }
+              ]
+            }
+          ],
+          max_tokens: 2000,
+          temperature: 0.1,
+          response_format: { type: "json_object" }
+        }
+      });
+
+      return JSON.parse(response.data.choices[0].message.content);
+    } catch (error) {
+      console.error('Error extracting schedule from image:', error.response?.data || error);
       throw error;
     }
   }
