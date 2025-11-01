@@ -339,8 +339,8 @@ async function handleViewSchedule(student, phoneNumber, aiResponse) {
     
     console.log(`📅 Fetching schedule for ${requestedDay}`);
     
-    // Get student's schedule
-    const schedule = await Schedule.findOne({ student: student._id }).populate('subjects');
+    // Get student's schedule (subjects are subdocuments, no need to populate)
+    const schedule = await Schedule.findOne({ student: student._id });
     
     if (!schedule) {
       await whatsappService.sendMessage(
@@ -352,8 +352,12 @@ async function handleViewSchedule(student, phoneNumber, aiResponse) {
       return;
     }
     
+    console.log(`📋 Schedule found with ${schedule.subjects.length} subjects and ${schedule.timeSlots.length} time slots`);
+    
     // Filter time slots for the requested day
     const daySlots = schedule.timeSlots.filter(slot => slot.day === requestedDay);
+    
+    console.log(`🔍 Found ${daySlots.length} slots for ${requestedDay}`);
     
     if (daySlots.length === 0) {
       await whatsappService.sendMessage(
@@ -551,6 +555,10 @@ async function processCompleteSchedule(student, phoneNumber) {
       timeSlots: []
     });
     
+    // IMPORTANT: Save the schedule first to generate _id for subdocuments
+    await schedule.save();
+    console.log('✅ Schedule document created with subject subdocuments');
+    
     // Add time slots from schedule
     let slotsAdded = 0;
     let skippedSlots = [];
@@ -607,22 +615,22 @@ async function processCompleteSchedule(student, phoneNumber) {
         }
         
         if (matchingSubject) {
-          // Find the subject subdocument in schedule.subjects array
+          // Find the subject subdocument in schedule.subjects array (now with _id)
           const subjectSubdoc = schedule.subjects.find(s => 
             normalizeCode(s.code) === normalizeCode(matchingSubject.code)
           );
           
-          if (subjectSubdoc) {
+          if (subjectSubdoc && subjectSubdoc._id) {
             schedule.timeSlots.push({
               day: dayData.day,
               startTime: slot.startTime,
               endTime: slot.endTime,
-              subject: subjectSubdoc._id  // Use the subdocument's _id
+              subject: subjectSubdoc._id  // Use the subdocument's _id (now exists after save)
             });
             slotsAdded++;
             console.log(`   ✅ ${slot.startTime}-${slot.endTime} → ${slot.subjectCode} (matched to ${matchingSubject.code})`);
           } else {
-            console.log(`   ⚠️  Subdocument not found for ${matchingSubject.code}`);
+            console.log(`   ⚠️  Subdocument not found or missing _id for ${matchingSubject.code}`);
             skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode}`);
           }
         } else {
@@ -639,9 +647,9 @@ async function processCompleteSchedule(student, phoneNumber) {
       console.log(`   Skipped details:`, skippedSlots);
     }
     
-    // Save schedule
+    // Save schedule again with time slots added
     await schedule.save();
-    console.log('✅ Schedule saved to database');
+    console.log('✅ Schedule with time slots saved to database');
     
     // Success message
     let successMsg = `✅ *Schedule Created Successfully!*\n\n` +
