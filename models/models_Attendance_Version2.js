@@ -1,14 +1,17 @@
 const mongoose = require('mongoose');
 
 const AttendanceRecordSchema = new mongoose.Schema({
-  student: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Student',
+  phoneNumber: {
+    type: String,
+    required: true,
+    index: true
+  },
+  subjectCode: {
+    type: String,
     required: true
   },
-  subject: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Subject',
+  subjectName: {
+    type: String,
     required: true
   },
   date: {
@@ -20,6 +23,10 @@ const AttendanceRecordSchema = new mongoose.Schema({
     enum: ['PRESENT', 'ABSENT', 'CANCELLED', 'HOLIDAY'],
     required: true
   },
+  timeSlot: {
+    type: String,
+    default: 'general'
+  },
   notes: {
     type: String
   },
@@ -28,5 +35,8 @@ const AttendanceRecordSchema = new mongoose.Schema({
     default: Date.now
   }
 });
+
+// Compound index for unique constraint: one record per phone+subject+date+timeSlot
+AttendanceRecordSchema.index({ phoneNumber: 1, subjectCode: 1, date: 1, timeSlot: 1 }, { unique: true });
 
 module.exports = mongoose.model('AttendanceRecord', AttendanceRecordSchema);

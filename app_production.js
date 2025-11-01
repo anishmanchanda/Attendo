@@ -152,7 +152,7 @@ whatsappService.on('message', async (message) => {
     }
 
     // Check if student needs to upload schedule
-    const schedule = await Schedule.findOne({ student: student._id });
+    const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
     
     if (!student.isRegistered || !schedule) {
       console.log('⚠️  Student needs to complete registration');
@@ -199,10 +199,23 @@ async function handleTextMessage(student, phoneNumber, text, messageId) {
       return;
     }
     
+    // Get student's schedule to provide context to AI
+    const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
+    
+    // Build subjects context for AI
+    let subjectsContext = null;
+    if (schedule && schedule.subjects.length > 0) {
+      subjectsContext = schedule.subjects.map(s => ({
+        code: s.code,
+        name: s.name
+      }));
+    }
+    
     // Process with AI
     const aiResponse = await aiService.processConversation(text, {
       student,
-      hasSchedule: !!(await Schedule.findOne({ student: student._id }))
+      hasSchedule: !!schedule,
+      subjects: subjectsContext
     });
 
     console.log('🤖 AI Action:', aiResponse.action);
@@ -223,6 +236,14 @@ async function handleTextMessage(student, phoneNumber, text, messageId) {
 
       case 'view_schedule':
         await handleViewSchedule(student, phoneNumber, aiResponse);
+        break;
+
+      case 'view_attendance_details':
+        await handleViewAttendanceDetails(student, phoneNumber, aiResponse);
+        break;
+
+      case 'modify_attendance':
+        await handleModifyAttendance(student, phoneNumber, aiResponse);
         break;
 
       default:
@@ -282,7 +303,7 @@ async function handleRegistration(student, phoneNumber, aiResponse) {
 
     // If registered, prompt for schedule
     if (student.isRegistered) {
-      const schedule = await Schedule.findOne({ student: student._id });
+      const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
       if (!schedule) {
         setTimeout(async () => {
           await whatsappService.sendMessage(
@@ -311,11 +332,20 @@ async function handleAttendanceRecording(student, phoneNumber, aiResponse, messa
       return;
     }
 
+    console.log('📝 Recording attendance:', {
+      phoneNumber: phoneNumber,
+      date: aiResponse.attendanceData.date,
+      isHoliday: aiResponse.attendanceData.isHoliday,
+      attendance: aiResponse.attendanceData.attendance
+    });
+
     // Record attendance using attendance service
-    await attendanceService.recordAttendance(
+    const records = await attendanceService.recordAttendance(
       student._id,
       aiResponse.attendanceData
     );
+
+    console.log(`✅ Recorded ${records.length} attendance entries`);
 
     await whatsappService.sendMessage(phoneNumber, aiResponse.message);
     
@@ -326,6 +356,10 @@ async function handleAttendanceRecording(student, phoneNumber, aiResponse, messa
 
   } catch (error) {
     console.error('Error in handleAttendanceRecording:', error);
+    await whatsappService.sendMessage(
+      phoneNumber,
+      '😔 Sorry, I had trouble recording your attendance. Please try again!'
+    );
     throw error;
   }
 }
@@ -335,12 +369,14 @@ async function handleAttendanceRecording(student, phoneNumber, aiResponse, messa
  */
 async function handleViewSchedule(student, phoneNumber, aiResponse) {
   try {
-    const requestedDay = aiResponse.day || new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    // Normalize the day name: capitalize first letter, lowercase rest
+    let requestedDay = aiResponse.day || new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    requestedDay = requestedDay.charAt(0).toUpperCase() + requestedDay.slice(1).toLowerCase();
     
     console.log(`📅 Fetching schedule for ${requestedDay}`);
     
-    // Get student's schedule (subjects are subdocuments, no need to populate)
-    const schedule = await Schedule.findOne({ student: student._id });
+    // Get student's MOST RECENT schedule (subjects are subdocuments, no need to populate)
+    const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
     
     if (!schedule) {
       await whatsappService.sendMessage(
@@ -353,11 +389,21 @@ async function handleViewSchedule(student, phoneNumber, aiResponse) {
     }
     
     console.log(`📋 Schedule found with ${schedule.subjects.length} subjects and ${schedule.timeSlots.length} time slots`);
+    console.log(`📋 Available days: ${[...new Set(schedule.timeSlots.map(s => s.day))].join(', ')}`);
     
-    // Filter time slots for the requested day
-    const daySlots = schedule.timeSlots.filter(slot => slot.day === requestedDay);
+    // Filter time slots for the requested day (case-insensitive comparison)
+    const daySlots = schedule.timeSlots.filter(slot => 
+      slot.day.toLowerCase() === requestedDay.toLowerCase()
+    );
     
     console.log(`🔍 Found ${daySlots.length} slots for ${requestedDay}`);
+    if (daySlots.length > 0) {
+      console.log('📋 First slot details:', {
+        day: daySlots[0].day,
+        subject: daySlots[0].subject,
+        startTime: daySlots[0].startTime
+      });
+    }
     
     if (daySlots.length === 0) {
       await whatsappService.sendMessage(
@@ -384,9 +430,14 @@ async function handleViewSchedule(student, phoneNumber, aiResponse) {
       // Find the subject details from the populated subjects array
       const subject = schedule.subjects.find(s => s._id.toString() === slot.subject.toString());
       
+      console.log(`🔍 Slot ${slot.startTime}: Looking for subject ${slot.subject}, Found: ${subject ? subject.code : 'NOT FOUND'}`);
+      
       if (subject) {
         message += `🕐 *${slot.startTime} - ${slot.endTime}*\n`;
         message += `   📚 ${subject.code} - ${subject.name}\n\n`;
+      } else {
+        console.log(`❌ WARNING: Subject not found for slot! Slot subject ID: ${slot.subject}`);
+        console.log(`   Available subject IDs in schedule:`, schedule.subjects.map(s => s._id.toString()));
       }
     }
     
@@ -445,6 +496,196 @@ async function handleSummaryRequest(student, phoneNumber) {
   } catch (error) {
     console.error('Error in handleSummaryRequest:', error);
     throw error;
+  }
+}
+
+/**
+ * Handle viewing attendance details for a specific subject
+ */
+async function handleViewAttendanceDetails(student, phoneNumber, aiResponse) {
+  try {
+    const subjectCode = aiResponse.subjectCode;
+    
+    if (!subjectCode) {
+      await whatsappService.sendMessage(phoneNumber, aiResponse.message);
+      return;
+    }
+    
+    // Get schedule to find total classes and subject name
+    const Schedule = require('./models/models_Schedule_Version2');
+    const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
+    
+    if (!schedule) {
+      await whatsappService.sendMessage(phoneNumber, 'Please upload your schedule first.');
+      return;
+    }
+    
+    // Find the subject in schedule
+    const subject = schedule.subjects.find(s => 
+      s.code.toLowerCase() === subjectCode.toLowerCase()
+    );
+    
+    if (!subject) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `❌ Subject ${subjectCode} not found in your schedule.`
+      );
+      return;
+    }
+    
+    // Count total time slots for this subject
+    const totalSlots = schedule.timeSlots.filter(slot => 
+      slot.subject.toString() === subject._id.toString()
+    ).length;
+    
+    // Get attendance records for this subject
+    const AttendanceRecord = require('./models/models_Attendance_Version2');
+    const records = await AttendanceRecord.find({ 
+      phoneNumber: student.phoneNumber,
+      subjectCode: subject.code
+    }).sort({ date: 1 });
+    
+    // Group by status
+    const present = records.filter(r => r.status === 'PRESENT');
+    const absent = records.filter(r => r.status === 'ABSENT');
+    
+    const percentage = totalSlots > 0 ? ((present.length / totalSlots) * 100).toFixed(1) : 0;
+    
+    let message = `📊 *${subject.code} - ${subject.name}*\n\n`;
+    message += `✅ Present: ${present.length}/${totalSlots} (${percentage}%)\n`;
+    message += `❌ Absent: ${absent.length}\n`;
+    message += `📚 Total Classes in Schedule: ${totalSlots}\n\n`;
+    
+    if (records.length === 0) {
+      message += `⚠️ *No attendance marked yet*\n`;
+      message += `You haven't marked any attendance for this subject.\n\n`;
+      message += `💡 Say "I attended all classes today" to mark attendance.`;
+    } else if (absent.length > 0) {
+      message += `*Missed Classes:*\n`;
+      absent.forEach(r => {
+        const date = new Date(r.date).toLocaleDateString('en-US', { 
+          month: 'short', 
+          day: 'numeric',
+          weekday: 'short'
+        });
+        const time = r.timeSlot !== 'general' ? ` (${r.timeSlot})` : '';
+        message += `❌ ${date}${time}\n`;
+      });
+      message += `\n`;
+    } else if (present.length > 0) {
+      message += `✅ *All marked classes attended!*\n\n`;
+    }
+    
+    message += `\n💡 To correct any mistake, say: "Mark me present/absent for ${subjectCode} on [date]"`;
+    
+    await whatsappService.sendMessage(phoneNumber, message);
+    
+  } catch (error) {
+    console.error('Error in handleViewAttendanceDetails:', error);
+    await whatsappService.sendMessage(
+      phoneNumber,
+      '😔 Sorry, I had trouble fetching attendance details. Please try again!'
+    );
+  }
+}
+
+/**
+ * Handle modifying attendance record
+ */
+async function handleModifyAttendance(student, phoneNumber, aiResponse) {
+  try {
+    const { subjectCode, date, status } = aiResponse;
+    
+    if (!subjectCode || !date || !status) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        '❓ Please specify:\n' +
+        '• Subject code (e.g., PC-209)\n' +
+        '• Date (e.g., "27th October" or "Monday")\n' +
+        '• Status (present or absent)\n\n' +
+        'Example: "Mark me present for PC-209 on 27th October"'
+      );
+      return;
+    }
+    
+    const AttendanceRecord = require('./models/models_Attendance_Version2');
+    const Schedule = require('./models/models_Schedule_Version2');
+    
+    // Get the schedule to find subject details
+    const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
+    const subject = schedule.subjects.find(s => 
+      s.code.toLowerCase() === subjectCode.toLowerCase()
+    );
+    
+    if (!subject) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `❌ Subject ${subjectCode} not found in your schedule.`
+      );
+      return;
+    }
+    
+    // Parse date
+    const targetDate = new Date(date);
+    const dayOfWeek = targetDate.toLocaleDateString('en-US', { weekday: 'long' });
+    
+    // Get time slots for this subject on this day
+    const daySlots = schedule.timeSlots.filter(slot => 
+      slot.day === dayOfWeek &&
+      slot.subject.toString() === subject._id.toString()
+    );
+    
+    if (daySlots.length === 0) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `❌ ${subjectCode} is not scheduled on ${dayOfWeek}s.`
+      );
+      return;
+    }
+    
+    // Update or create attendance for each slot
+    let updated = 0;
+    for (const slot of daySlots) {
+      const timeSlotKey = `${slot.startTime}-${slot.endTime}`;
+      
+      const record = await AttendanceRecord.findOneAndUpdate(
+        {
+          phoneNumber: student.phoneNumber,
+          subjectCode: subject.code,
+          date: {
+            $gte: new Date(targetDate.setHours(0, 0, 0, 0)),
+            $lt: new Date(targetDate.setHours(23, 59, 59, 999))
+          },
+          timeSlot: timeSlotKey
+        },
+        {
+          phoneNumber: student.phoneNumber,
+          subjectCode: subject.code,
+          subjectName: subject.name,
+          date: targetDate,
+          status: status.toUpperCase(),
+          timeSlot: timeSlotKey,
+          notes: 'Modified by student'
+        },
+        { upsert: true, new: true }
+      );
+      
+      updated++;
+    }
+    
+    await whatsappService.sendMessage(
+      phoneNumber,
+      `✅ Updated ${updated} attendance record(s) for ${subjectCode} on ${dayOfWeek}, ${targetDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}\n\n` +
+      `Status: ${status.toUpperCase()}\n\n` +
+      `💡 Check your summary with "show my attendance"`
+    );
+    
+  } catch (error) {
+    console.error('Error in handleModifyAttendance:', error);
+    await whatsappService.sendMessage(
+      phoneNumber,
+      '😔 Sorry, I had trouble modifying attendance. Please try again!'
+    );
   }
 }
 
@@ -557,11 +798,14 @@ async function processCompleteSchedule(student, phoneNumber) {
     
     // IMPORTANT: Save the schedule first to generate _id for subdocuments
     await schedule.save();
-    console.log('✅ Schedule document created with subject subdocuments');
+    console.log('✅ Schedule saved, subdocuments now have _id values');
     
     // Add time slots from schedule
     let slotsAdded = 0;
     let skippedSlots = [];
+    
+    console.log('\n📅 Processing time slots from schedule data:');
+    console.log(`   Total days: ${scheduleData.schedule.length}`);
     
     for (const dayData of scheduleData.schedule) {
       console.log(`\n📅 Processing ${dayData.day}:`, dayData.slots?.length || 0, 'slots');
@@ -572,12 +816,16 @@ async function processCompleteSchedule(student, phoneNumber) {
       }
       
       for (const slot of dayData.slots) {
+        console.log(`\n   🔍 Processing slot: ${slot.startTime}-${slot.endTime}, Subject: "${slot.subjectCode}"`);
+        
         // Extract base subject code (remove teacher names, lab groups, etc.)
         // Examples: "PC209/AH" -> "PC209", "PC253/TBA/ETL312/Grp A" -> "PC253"
         let baseCode = slot.subjectCode.split('/')[0].trim();
+        console.log(`      Base code extracted: "${baseCode}"`);
         
         // Try to find matching subject using multiple strategies
         const normalizedSlotCode = normalizeCode(baseCode);
+        console.log(`      Normalized code: "${normalizedSlotCode}"`);
         
         // Strategy 1: Exact match with original code
         let matchingSubject = subjectMap.get(slot.subjectCode);
@@ -592,23 +840,16 @@ async function processCompleteSchedule(student, phoneNumber) {
           matchingSubject = subjectMap.get(normalizedSlotCode);
         }
         
+        console.log(`      Direct lookup result: ${matchingSubject ? matchingSubject.code : 'NOT FOUND'}`);
+        
         // Strategy 4: Search through all subjects for partial match
         if (!matchingSubject) {
+          console.log(`      Trying partial match...`);
           for (const [key, subject] of subjectMap.entries()) {
             const normalizedKey = normalizeCode(key);
             if (normalizedKey === normalizedSlotCode || normalizedKey.includes(normalizedSlotCode) || normalizedSlotCode.includes(normalizedKey)) {
               matchingSubject = subject;
-              console.log(`   🔍 Found match: "${slot.subjectCode}" -> "${subject.code}" via partial match`);
-              break;
-            }
-          }
-        }
-        
-        if (!matchingSubject) {
-          // Try partial match
-          for (const [code, subject] of subjectMap.entries()) {
-            if (normalizeCode(code) === normalizedSlotCode) {
-              matchingSubject = subject;
+              console.log(`      ✅ Found via partial match: "${key}" -> "${subject.code}"`);
               break;
             }
           }
@@ -620,7 +861,11 @@ async function processCompleteSchedule(student, phoneNumber) {
             normalizeCode(s.code) === normalizeCode(matchingSubject.code)
           );
           
+          console.log(`      Looking for subdocument with code: "${matchingSubject.code}"`);
+          console.log(`      Found subdocument: ${subjectSubdoc ? 'YES' : 'NO'}`);
+          
           if (subjectSubdoc && subjectSubdoc._id) {
+            console.log(`      Subdocument _id: ${subjectSubdoc._id}`);
             schedule.timeSlots.push({
               day: dayData.day,
               startTime: slot.startTime,
@@ -628,28 +873,29 @@ async function processCompleteSchedule(student, phoneNumber) {
               subject: subjectSubdoc._id  // Use the subdocument's _id (now exists after save)
             });
             slotsAdded++;
-            console.log(`   ✅ ${slot.startTime}-${slot.endTime} → ${slot.subjectCode} (matched to ${matchingSubject.code})`);
+            console.log(`      ✅ ADDED: ${dayData.day} ${slot.startTime}-${slot.endTime} → ${matchingSubject.code}`);
           } else {
-            console.log(`   ⚠️  Subdocument not found or missing _id for ${matchingSubject.code}`);
-            skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode}`);
+            console.log(`      ❌ FAILED: Subdocument not found or missing _id`);
+            skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode} (subdoc not found)`);
           }
         } else {
-          console.log(`   ❌ No match found for "${slot.subjectCode}"`);
-          skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode}`);
+          console.log(`      ❌ FAILED: No matching subject found`);
+          skippedSlots.push(`${dayData.day} ${slot.startTime}-${slot.endTime}: ${slot.subjectCode} (no match)`);
         }
       }
     }
     
     console.log(`\n📊 Summary:`);
-    console.log(`   ✅ Slots added: ${slotsAdded}`);
+    console.log(`   ✅ Slots successfully added: ${slotsAdded}`);
     console.log(`   ❌ Skipped slots: ${skippedSlots.length}`);
     if (skippedSlots.length > 0) {
-      console.log(`   Skipped details:`, skippedSlots);
+      console.log(`   Skipped details:`);
+      skippedSlots.forEach(s => console.log(`      - ${s}`));
     }
     
-    // Save schedule again with time slots added
+    console.log(`\n💾 Saving schedule with ${slotsAdded} time slots...`);
     await schedule.save();
-    console.log('✅ Schedule with time slots saved to database');
+    console.log('✅ Schedule saved to database');
     
     // Success message
     let successMsg = `✅ *Schedule Created Successfully!*\n\n` +

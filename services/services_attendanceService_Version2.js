@@ -92,16 +92,27 @@ class AttendanceService {
     try {
       const date = moment(attendanceData.date).startOf('day').toDate();
       
+      // Get student to get phone number
+      const student = await Student.findById(studentId);
+      if (!student) throw new Error('Student not found');
+      
+      const phoneNumber = student.phoneNumber;
+      
       // If it's a holiday, mark all subjects as HOLIDAY
       if (attendanceData.isHoliday) {
-        const schedule = await Schedule.findOne({ student: studentId });
-        const subjects = [...new Set(schedule.timeSlots
+        const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+        if (!schedule) throw new Error('Schedule not found');
+        
+        const uniqueSubjects = [...new Map(schedule.timeSlots
           .filter(slot => slot.day === moment(date).format('dddd'))
-          .map(slot => slot.subject.toString()))];
+          .map(slot => {
+            const subj = schedule.subjects.find(s => s._id.toString() === slot.subject.toString());
+            return [subj.code, subj];
+          })).values()];
           
         // Delete any existing records for this date
         await AttendanceRecord.deleteMany({
-          student: studentId,
+          phoneNumber: phoneNumber,
           date: {
             $gte: date,
             $lt: moment(date).add(1, 'days').toDate()
@@ -109,9 +120,10 @@ class AttendanceService {
         });
         
         // Create holiday records
-        const records = subjects.map(subjectId => ({
-          student: studentId,
-          subject: subjectId,
+        const records = uniqueSubjects.map(subject => ({
+          phoneNumber: phoneNumber,
+          subjectCode: subject.code,
+          subjectName: subject.name,
           date,
           status: 'HOLIDAY',
           notes: 'Holiday reported by student'
@@ -122,42 +134,97 @@ class AttendanceService {
       }
       
       // Regular attendance recording
+      const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+      if (!schedule) throw new Error('Schedule not found');
+      
+      // If needsDayFilter is true, get ALL time slots for that day
+      if (attendanceData.needsDayFilter) {
+        const dayOfWeek = moment(date).format('dddd'); // Monday, Tuesday, etc.
+        console.log(`🗓️  Filtering attendance for ${dayOfWeek}'s classes only`);
+        
+        // Get ALL time slots for this day (not just unique subjects)
+        const daySlots = schedule.timeSlots.filter(slot => slot.day === dayOfWeek);
+        
+        console.log(`   Found ${daySlots.length} time slots scheduled on ${dayOfWeek}`);
+        
+        // Override the attendance list with ALL time slots
+        const defaultStatus = attendanceData.attendance.length > 0 ? attendanceData.attendance[0].status : 'PRESENT';
+        attendanceData.attendance = daySlots.map(slot => {
+          const subj = schedule.subjects.find(s => s._id.toString() === slot.subject.toString());
+          return {
+            subjectCode: subj.code,
+            status: defaultStatus,
+            startTime: slot.startTime,
+            endTime: slot.endTime
+          };
+        });
+        
+        console.log(`   Recording attendance for ${attendanceData.attendance.length} time slots on ${dayOfWeek}`);
+      }
+      
       const records = [];
       for (const entry of attendanceData.attendance) {
-        // Find the subject
-        const schedule = await Schedule.findOne({ student: studentId })
-          .populate('subjects');
-          
-        const subject = schedule.subjects.find(s => s.code === entry.subjectCode);
+        console.log(`🔍 Looking for subject: "${entry.subjectCode}"`);
         
-        if (!subject) continue;
+        // Find the subject in schedule
+        const subject = schedule.subjects.find(s => 
+          s.code === entry.subjectCode || 
+          s.code.replace(/\s+/g, '') === entry.subjectCode.replace(/\s+/g, '')
+        );
         
-        // Delete any existing record for this subject on this date
-        await AttendanceRecord.deleteOne({
-          student: studentId,
-          subject: subject._id,
+        if (!subject) {
+          console.log(`⚠️  Subject not found: ${entry.subjectCode}`);
+          console.log(`   Available subjects: ${schedule.subjects.map(s => s.code).join(', ')}`);
+          continue;
+        }
+        
+        console.log(`✅ Matched subject: ${subject.code} - ${subject.name}`);
+        
+        // Create unique time slot identifier
+        const timeSlotKey = entry.startTime && entry.endTime 
+          ? `${entry.startTime}-${entry.endTime}` 
+          : 'general';
+        
+        console.log(`   Time slot: ${timeSlotKey}`);
+        
+        // Check if attendance already exists for this specific time slot
+        const existing = await AttendanceRecord.findOne({
+          phoneNumber: phoneNumber,
+          subjectCode: subject.code,
           date: {
             $gte: date,
             $lt: moment(date).add(1, 'days').toDate()
-          }
+          },
+          timeSlot: timeSlotKey
         });
+        
+        if (existing) {
+          console.log(`   ⚠️  Already recorded for this time slot, updating...`);
+          existing.status = entry.status;
+          await existing.save();
+          records.push(existing);
+          continue;
+        }
         
         // Create new attendance record
         const record = new AttendanceRecord({
-          student: studentId,
-          subject: subject._id,
+          phoneNumber: phoneNumber,
+          subjectCode: subject.code,
+          subjectName: subject.name,
           date,
           status: entry.status,
+          timeSlot: timeSlotKey,
           notes: entry.notes || ''
         });
         
         await record.save();
         records.push(record);
+        console.log(`   ✅ Recorded attendance for ${timeSlotKey}`);
         
-        // Update total classes count if not cancelled
+        // Update total classes count in schedule subdocument if not cancelled
         if (entry.status !== 'CANCELLED') {
           subject.totalClasses += 1;
-          await subject.save();
+          await schedule.save();
         }
       }
       
@@ -170,9 +237,14 @@ class AttendanceService {
 
   async getAttendanceSummary(studentId) {
     try {
+      // Get student to get phone number
+      const student = await Student.findById(studentId);
+      if (!student) throw new Error('Student not found');
+      
+      const phoneNumber = student.phoneNumber;
+      
       // Get student schedule with subjects
-      const schedule = await Schedule.findOne({ student: studentId })
-        .populate('subjects');
+      const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
         
       if (!schedule) {
         // Return empty summary if no schedule exists
@@ -186,8 +258,8 @@ class AttendanceService {
         };
       }
       
-      // Get attendance records
-      const records = await AttendanceRecord.find({ student: studentId });
+      // Get attendance records using phone number
+      const records = await AttendanceRecord.find({ phoneNumber: phoneNumber });
       
       // Calculate overall attendance
       const subjectsData = [];
@@ -195,26 +267,34 @@ class AttendanceService {
       let totalPresent = 0;
       
       for (const subject of schedule.subjects) {
+        // Count total time slots for this subject in schedule
+        const totalSlotsInSchedule = schedule.timeSlots.filter(slot => 
+          slot.subject.toString() === subject._id.toString()
+        ).length;
+        
+        // Get attendance records for this subject
         const subjectRecords = records.filter(r => 
-          r.subject.toString() === subject._id.toString() && 
+          r.subjectCode === subject.code && 
           r.status !== 'CANCELLED' && 
           r.status !== 'HOLIDAY'
         );
         
         const presentCount = subjectRecords.filter(r => r.status === 'PRESENT').length;
-        const totalCount = subject.totalClasses;
+        const absentCount = subjectRecords.filter(r => r.status === 'ABSENT').length;
+        const totalRecorded = presentCount + absentCount;
         
-        const percentage = totalCount > 0 ? (presentCount / totalCount * 100).toFixed(2) : 'N/A';
+        // Use totalSlotsInSchedule as the total classes
+        const percentage = totalSlotsInSchedule > 0 ? (presentCount / totalSlotsInSchedule * 100).toFixed(1) : 'N/A';
         
         subjectsData.push({
           code: subject.code,
           name: subject.name,
           present: presentCount,
-          total: totalCount,
+          total: totalSlotsInSchedule,
           percentage: percentage
         });
         
-        totalClasses += totalCount;
+        totalClasses += totalSlotsInSchedule;
         totalPresent += presentCount;
       }
       

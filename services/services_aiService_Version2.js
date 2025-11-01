@@ -25,6 +25,8 @@ class AIService {
               Current date: ${new Date().toISOString().split('T')[0]}
               Current day: ${new Date().toLocaleDateString('en-US', { weekday: 'long' })}
               
+              ${studentContext.subjects ? `Student's subjects:\n${studentContext.subjects.map(s => `- ${s.code}: ${s.name}`).join('\n')}` : 'No subjects registered yet.'}
+              
               Based on the student's message, decide what action to take and respond appropriately.
               
               AVAILABLE ACTIONS:
@@ -32,27 +34,56 @@ class AIService {
               2. "record_attendance" - when student reports attendance 
               3. "get_summary" - when student wants attendance summary
               4. "view_schedule" - when student asks about their schedule/timetable/classes (e.g., "what classes do I have on Monday?", "show my schedule", "what's my timetable?")
-              5. "general_conversation" - for any other conversation
+              5. "view_attendance_details" - when student asks about specific attendance (e.g., "when did I miss OS?", "show my PC-205 attendance", "which classes did I miss?")
+              6. "modify_attendance" - when student wants to correct/change attendance (e.g., "I actually attended PC-209 on Monday", "mark me present for OS on 27th")
+              7. "general_conversation" - for any other conversation
               
               For registration, extract name and roll number from the message.
+              
               For attendance, parse which subjects they attended/missed and create attendance data.
+              IMPORTANT: Use the EXACT subject codes from the student's subjects list above.
+              
+              CRITICAL: When recording attendance:
+              1. First determine the DAY OF THE WEEK for the date mentioned
+              2. Set a special flag "needsDayFilter: true" if they say "all classes" without mentioning specific subjects
+              3. If specific subjects are mentioned by name/code, use those exact codes
+              
+              Examples:
+              - "attended all classes on 27th November" → set needsDayFilter: true, the backend will filter by schedule for that day
+              - "attended all classes today" → set needsDayFilter: true for today's schedule
+              - "attended OS and DAA on Monday" → use specific codes: PC-209 and PC-207
+              - "missed DBMS lab" → use specific code: PC-251
+              
               For summaries, acknowledge the request.
+              
+              For view_attendance_details, extract the subject code or name they're asking about. Set "subjectCode" field.
+              
+              For modify_attendance, extract:
+              - Subject code
+              - Date (if mentioned)
+              - New status (PRESENT or ABSENT)
+              Example: "I actually attended PC-209 on Monday" → {"subjectCode": "PC-209", "date": "2025-10-28", "status": "PRESENT"}
+              
               For view_schedule, extract the day they're asking about (or use current day if not specified). Set "day" field to: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, or Sunday.
               For general conversation, be helpful and guide them.
               
               ALWAYS respond in this JSON format:
               {
-                "action": "register_student|record_attendance|get_summary|view_schedule|general_conversation",
+                "action": "register_student|record_attendance|get_summary|view_schedule|view_attendance_details|modify_attendance|general_conversation",
                 "message": "Your conversational response to the student",
                 "day": "Monday|Tuesday|etc (only for view_schedule action)",
+                "subjectCode": "PC-209 (for view_attendance_details and modify_attendance)",
+                "date": "YYYY-MM-DD (for modify_attendance)",
+                "status": "PRESENT|ABSENT (for modify_attendance)",
                 "name": "extracted name (for registration)",
                 "rollNumber": "extracted roll number (for registration)", 
                 "semester": number (for registration),
                 "attendanceData": {
                   "date": "YYYY-MM-DD",
                   "isHoliday": boolean,
+                  "needsDayFilter": boolean (true if "all classes" without specific subjects),
                   "attendance": [
-                    {"subjectCode": "CS101", "status": "PRESENT|ABSENT|CANCELLED"}
+                    {"subjectCode": "PC-209", "status": "PRESENT|ABSENT|CANCELLED"}
                   ]
                 }
               }

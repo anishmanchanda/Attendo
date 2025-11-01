@@ -78,12 +78,14 @@ async function handleSummaryRequest(student, phoneNumber, whatsappService) {
  */
 async function handleViewSchedule(student, phoneNumber, aiResponse, whatsappService) {
   try {
-    const requestedDay = aiResponse.day || new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    // Normalize the day name: capitalize first letter, lowercase rest
+    let requestedDay = aiResponse.day || new Date().toLocaleDateString('en-US', { weekday: 'long' });
+    requestedDay = requestedDay.charAt(0).toUpperCase() + requestedDay.slice(1).toLowerCase();
     
     console.log(`📅 Fetching schedule for ${requestedDay}`);
     
     // Get student's schedule
-    const schedule = await Schedule.findOne({ student: student._id }).populate('subjects');
+    const schedule = await Schedule.findOne({ student: student._id });
     
     if (!schedule) {
       await whatsappService.sendMessage(
@@ -95,8 +97,13 @@ async function handleViewSchedule(student, phoneNumber, aiResponse, whatsappServ
       return;
     }
     
-    // Filter time slots for the requested day
-    const daySlots = schedule.timeSlots.filter(slot => slot.day === requestedDay);
+    console.log(`📋 Schedule found with ${schedule.subjects.length} subjects and ${schedule.timeSlots.length} time slots`);
+    console.log(`📋 Available days: ${[...new Set(schedule.timeSlots.map(s => s.day))].join(', ')}`);
+    
+    // Filter time slots for the requested day (case-insensitive comparison)
+    const daySlots = schedule.timeSlots.filter(slot => 
+      slot.day.toLowerCase() === requestedDay.toLowerCase()
+    );
     
     if (daySlots.length === 0) {
       await whatsappService.sendMessage(
