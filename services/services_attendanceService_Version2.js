@@ -90,13 +90,33 @@ class AttendanceService {
 
   async recordAttendance(studentId, attendanceData) {
     try {
-      const date = moment(attendanceData.date).startOf('day').toDate();
+      let date = moment(attendanceData.date).startOf('day');
       
       // Get student to get phone number
       const student = await Student.findById(studentId);
       if (!student) throw new Error('Student not found');
       
       const phoneNumber = student.phoneNumber;
+      
+      // Get schedule first to validate against actual class days
+      const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+      if (!schedule) throw new Error('Schedule not found');
+      
+      // If needsDayFilter is true, we need to validate the date matches the day
+      if (attendanceData.needsDayFilter) {
+        const actualDayOfWeek = date.format('dddd'); // Monday, Tuesday, etc.
+        
+        // Check if there are any classes scheduled on this day
+        const classesOnThisDay = schedule.timeSlots.filter(slot => slot.day === actualDayOfWeek);
+        
+        if (classesOnThisDay.length === 0) {
+          throw new Error(`No classes scheduled on ${actualDayOfWeek}. Please check your schedule.`);
+        }
+        
+        console.log(`✅ Validated: ${date.format('YYYY-MM-DD')} is a ${actualDayOfWeek} with ${classesOnThisDay.length} classes`);
+      }
+      
+      date = date.toDate();
       
       // If it's a holiday, mark all subjects as HOLIDAY
       if (attendanceData.isHoliday) {
@@ -133,10 +153,7 @@ class AttendanceService {
         return records;
       }
       
-      // Regular attendance recording
-      const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
-      if (!schedule) throw new Error('Schedule not found');
-      
+      // Regular attendance recording - schedule already fetched above
       // If needsDayFilter is true, get ALL time slots for that day
       if (attendanceData.needsDayFilter) {
         const dayOfWeek = moment(date).format('dddd'); // Monday, Tuesday, etc.

@@ -3,7 +3,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const WhatsAppBusinessService = require('./services/services_whatsapp_business');
 const AIService = require('./services/services_aiService_Version2');
-const attendanceService = require('./services/services_attendanceService_Version2'); // Already an instance
+const attendanceService = require('./services/services_attendanceService_Production'); // Production version
+const monitoringService = require('./services/services_monitoring');
 const Student = require('./models/models_Student_Version2');
 const { Schedule, Subject } = require('./models/models_Schedule_Version2');
 
@@ -31,6 +32,28 @@ app.use(express.urlencoded({ extended: true }));
 
 // Trust proxy (required for Render)
 app.set('trust proxy', 1);
+
+// Monitoring middleware - track request start time
+app.use((req, res, next) => {
+  req.startTime = Date.now();
+  
+  // Track request from WhatsApp
+  const phoneNumber = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
+  if (phoneNumber) {
+    monitoringService.trackRequest(phoneNumber);
+  }
+  
+  next();
+});
+
+// Response time tracking
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    const duration = Date.now() - req.startTime;
+    monitoringService.trackRequestTime(duration);
+  });
+  next();
+});
 
 // Initialize services
 let whatsappService;
@@ -90,6 +113,7 @@ app.get('/health', (req, res) => {
     status: mongooseConnected ? 'ok' : 'degraded',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
+    version: '2.0.0-production',
     services: {
       mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
       whatsapp: whatsappService ? 'initialized' : 'not initialized',
@@ -100,6 +124,26 @@ app.get('/health', (req, res) => {
 
   const statusCode = health.status === 'ok' ? 200 : 503;
   res.status(statusCode).json(health);
+});
+
+// Metrics endpoint for monitoring (admin only)
+app.get('/metrics', (req, res) => {
+  const adminKey = process.env.ADMIN_KEY || 'dev_admin_key';
+  if (req.query.key !== adminKey) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  
+  res.json({
+    ...monitoringService.getMetrics(),
+    serverUptime: Math.floor(process.uptime()) + 's',
+    memory: {
+      rss: (process.memoryUsage().rss / 1024 / 1024).toFixed(2) + ' MB',
+      heapUsed: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2) + ' MB',
+      heapTotal: (process.memoryUsage().heapTotal / 1024 / 1024).toFixed(2) + ' MB'
+    },
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+    version: '2.0.0-production'
+  });
 });
 
 // Initialize services and setup webhook
@@ -512,7 +556,6 @@ async function handleViewAttendanceDetails(student, phoneNumber, aiResponse) {
     }
     
     // Get schedule to find total classes and subject name
-    const Schedule = require('./models/models_Schedule_Version2');
     const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
     
     if (!schedule) {
@@ -547,33 +590,48 @@ async function handleViewAttendanceDetails(student, phoneNumber, aiResponse) {
     
     // Group by status
     const present = records.filter(r => r.status === 'PRESENT');
-    const absent = records.filter(r => r.status === 'ABSENT');
+    const explicitAbsent = records.filter(r => r.status === 'ABSENT');
+    
+    // Calculate actual absent: Total scheduled classes - Present classes
+    const actualAbsent = totalSlots - present.length;
     
     const percentage = totalSlots > 0 ? ((present.length / totalSlots) * 100).toFixed(1) : 0;
     
     let message = `📊 *${subject.code} - ${subject.name}*\n\n`;
     message += `✅ Present: ${present.length}/${totalSlots} (${percentage}%)\n`;
-    message += `❌ Absent: ${absent.length}\n`;
+    message += `❌ Absent/Not Marked: ${actualAbsent}\n`;
     message += `📚 Total Classes in Schedule: ${totalSlots}\n\n`;
     
     if (records.length === 0) {
       message += `⚠️ *No attendance marked yet*\n`;
-      message += `You haven't marked any attendance for this subject.\n\n`;
+      message += `All ${totalSlots} classes count as absent until marked.\n\n`;
       message += `💡 Say "I attended all classes today" to mark attendance.`;
-    } else if (absent.length > 0) {
-      message += `*Missed Classes:*\n`;
-      absent.forEach(r => {
-        const date = new Date(r.date).toLocaleDateString('en-US', { 
-          month: 'short', 
-          day: 'numeric',
-          weekday: 'short'
+    } else if (actualAbsent > 0) {
+      message += `*Classes Not Attended:*\n`;
+      
+      // Show explicitly marked absent classes
+      if (explicitAbsent.length > 0) {
+        message += `\n📍 *Marked as Absent:*\n`;
+        explicitAbsent.forEach(r => {
+          const date = new Date(r.date).toLocaleDateString('en-US', { 
+            month: 'short', 
+            day: 'numeric',
+            weekday: 'short'
+          });
+          const time = r.timeSlot !== 'general' ? ` (${r.timeSlot})` : '';
+          message += `❌ ${date}${time}\n`;
         });
-        const time = r.timeSlot !== 'general' ? ` (${r.timeSlot})` : '';
-        message += `❌ ${date}${time}\n`;
-      });
+      }
+      
+      // Calculate unrecorded classes
+      const unrecorded = actualAbsent - explicitAbsent.length;
+      if (unrecorded > 0) {
+        message += `\n⚠️ *${unrecorded} class${unrecorded > 1 ? 'es' : ''} not recorded*\n`;
+        message += `(These count as absent for attendance percentage)\n`;
+      }
       message += `\n`;
     } else if (present.length > 0) {
-      message += `✅ *All marked classes attended!*\n\n`;
+      message += `✅ *Perfect attendance for all marked classes!*\n\n`;
     }
     
     message += `\n💡 To correct any mistake, say: "Mark me present/absent for ${subjectCode} on [date]"`;
@@ -998,6 +1056,13 @@ connectDB().then(() => {
   process.exit(1);
 });
 
+// Error handling middleware (must be last)
+app.use((err, req, res, next) => {
+  monitoringService.trackError(err);
+  console.error('💥 Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('\n👋 SIGTERM received, shutting down gracefully...');
@@ -1022,5 +1087,7 @@ process.on('SIGINT', async () => {
     process.exit(1);
   }
 });
+
+module.exports = app;
 
 module.exports = app;

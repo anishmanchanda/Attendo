@@ -1,42 +1,62 @@
 const mongoose = require('mongoose');
 
-const AttendanceRecordSchema = new mongoose.Schema({
+const attendanceSchema = new mongoose.Schema({
   phoneNumber: {
     type: String,
     required: true,
     index: true
   },
+  date: {
+    type: Date,
+    required: true,
+    index: true
+  },
   subjectCode: {
     type: String,
-    required: true
+    required: true,
+    index: true
   },
   subjectName: {
     type: String,
     required: true
   },
-  date: {
-    type: Date,
-    required: true
-  },
   status: {
     type: String,
-    enum: ['PRESENT', 'ABSENT', 'CANCELLED', 'HOLIDAY'],
-    required: true
+    enum: ['PRESENT', 'ABSENT', 'HOLIDAY', 'CANCELLED'],
+    default: 'PRESENT'
   },
   timeSlot: {
     type: String,
+    required: true,
     default: 'general'
   },
   notes: {
-    type: String
+    type: String,
+    default: ''
   },
   createdAt: {
+    type: Date,
+    default: Date.now,
+    index: true
+  },
+  updatedAt: {
     type: Date,
     default: Date.now
   }
 });
 
-// Compound index for unique constraint: one record per phone+subject+date+timeSlot
-AttendanceRecordSchema.index({ phoneNumber: 1, subjectCode: 1, date: 1, timeSlot: 1 }, { unique: true });
+// Compound unique index to prevent duplicate attendance records
+attendanceSchema.index({ phoneNumber: 1, subjectCode: 1, date: 1, timeSlot: 1 }, { unique: true });
 
-module.exports = mongoose.model('AttendanceRecord', AttendanceRecordSchema);
+// Compound indexes for efficient queries
+attendanceSchema.index({ phoneNumber: 1, date: 1 });
+attendanceSchema.index({ phoneNumber: 1, subjectCode: 1 });
+attendanceSchema.index({ phoneNumber: 1, status: 1 });
+
+// Update updatedAt on save
+attendanceSchema.pre('save', function(next) {
+  this.updatedAt = new Date();
+  next();
+});
+
+module.exports = mongoose.model('Attendance', attendanceSchema);
