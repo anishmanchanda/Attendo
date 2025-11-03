@@ -303,6 +303,15 @@ async function handleTextMessage(student, phoneNumber, text, messageId) {
         await attendanceHandler.handleViewSchedule(student, phoneNumber, aiResponse, whatsappService);
         break;
 
+      case 'modify_attendance':
+        await attendanceHandler.handleModifyAttendance(
+          student,
+          phoneNumber,
+          aiResponse,
+          whatsappService
+        );
+        break;
+
       default:
         await whatsappService.sendMessage(phoneNumber, aiResponse.message);
     }

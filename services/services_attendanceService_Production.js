@@ -351,8 +351,10 @@ class AttendanceService {
       const phoneNumber = student.phoneNumber;
       console.log(`📊 Getting attendance summary for ${phoneNumber}`);
 
+      // Get schedule for subjects list
       const schedule = await this.getSchedule(studentId);
 
+      // Use recorded PRESENT/ABSENT entries to compute summary (more robust if schedule slots are sparse)
       const records = await AttendanceRecord.find({ 
         phoneNumber,
         status: { $in: ['PRESENT', 'ABSENT'] }
@@ -360,55 +362,236 @@ class AttendanceService {
 
       console.log(`   Found ${records.length} attendance records`);
 
-      const recordsBySubject = records.reduce((acc, record) => {
-        if (!acc[record.subjectCode]) {
-          acc[record.subjectCode] = [];
-        }
-        acc[record.subjectCode].push(record);
-        return acc;
-      }, {});
+      const subjects = schedule.subjects || [];
+      const subjectStats = [];
+      let overallPresent = 0;
+      let overallTotal = 0;
 
-      const subjectStats = schedule.subjects.map(subject => {
-        const totalSlots = schedule.timeSlots.filter(slot => 
-          slot.subject.toString() === subject._id.toString()
-        ).length;
-
-        const subjectRecords = recordsBySubject[subject.code] || [];
+      for (const subject of subjects) {
+        const subjectRecords = records.filter(r => r.subjectCode === subject.code);
         const presentCount = subjectRecords.filter(r => r.status === 'PRESENT').length;
         const absentCount = subjectRecords.filter(r => r.status === 'ABSENT').length;
+        const totalRecorded = presentCount + absentCount;
+        const percentage = totalRecorded > 0 ? ((presentCount / totalRecorded) * 100).toFixed(1) : '0.0';
 
-        const percentage = totalSlots > 0 
-          ? ((presentCount / totalSlots) * 100).toFixed(1) 
-          : '0.0';
-
-        return {
+        subjectStats.push({
           code: subject.code,
           name: subject.name,
           present: presentCount,
           absent: absentCount,
-          notMarked: totalSlots - presentCount - absentCount,
-          total: totalSlots,
+          total: totalRecorded,
           percentage
-        };
-      });
+        });
 
-      const totalSlots = subjectStats.reduce((sum, s) => sum + s.total, 0);
-      const totalPresent = subjectStats.reduce((sum, s) => sum + s.present, 0);
-      const overallPercentage = totalSlots > 0 
-        ? ((totalPresent / totalSlots) * 100).toFixed(1) 
-        : '0.0';
+        // Debug log per-subject summary for verification
+        try {
+          console.log(`   ▶ ${subject.code}: present=${presentCount}, absent=${absentCount}, totalRecorded=${totalRecorded}, pct=${percentage}%`);
+        } catch (_) {}
 
-      return {
+        overallPresent += presentCount;
+        overallTotal += totalRecorded;
+      }
+
+      const summary = {
         overall: {
-          present: totalPresent,
-          total: totalSlots,
-          percentage: overallPercentage
+          present: overallPresent,
+          total: overallTotal,
+          percentage: overallTotal > 0 ? ((overallPresent / overallTotal) * 100).toFixed(1) : '0.0'
         },
         subjects: subjectStats
       };
 
+      // Debug log overall summary for verification
+      try {
+        console.log(`   ▶ OVERALL: present=${summary.overall.present}, total=${summary.overall.total}, pct=${summary.overall.percentage}%`);
+      } catch (_) {}
+
+      return summary;
+
     } catch (error) {
       console.error('❌ Error getting attendance summary:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Rename a subject (code/name) and migrate attendance records accordingly
+   */
+  async renameSubject(studentId, { oldSubjectCode, newSubjectCode, newSubjectName }) {
+    if (!oldSubjectCode || (!newSubjectCode && !newSubjectName)) {
+      throw new Error('Missing fields: oldSubjectCode and at least one of newSubjectCode/newSubjectName are required');
+    }
+
+    const student = await Student.findById(studentId);
+    if (!student) throw new Error('Student not found');
+
+    const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+    if (!schedule) throw new Error('Schedule not found');
+
+    const subject = schedule.subjects.find(s => s.code.toLowerCase() === oldSubjectCode.toLowerCase());
+    if (!subject) throw new Error(`Subject ${oldSubjectCode} not found in schedule`);
+
+    const prevCode = subject.code;
+    const prevName = subject.name;
+
+    if (newSubjectCode) subject.code = newSubjectCode;
+    if (newSubjectName) subject.name = newSubjectName;
+    await schedule.save();
+
+    // Migrate attendance records to the new code/name
+    const updateSet = {};
+    if (newSubjectCode) updateSet.subjectCode = newSubjectCode;
+    if (newSubjectName) updateSet.subjectName = newSubjectName;
+
+    let migrated = 0;
+    if (Object.keys(updateSet).length > 0) {
+      const res = await AttendanceRecord.updateMany(
+        { phoneNumber: student.phoneNumber, subjectCode: prevCode },
+        { $set: updateSet }
+      );
+      migrated = res.modifiedCount || 0;
+    }
+
+    this.clearCache(studentId, student.phoneNumber);
+    return { renamed: true, from: { code: prevCode, name: prevName }, to: { code: subject.code, name: subject.name }, migrated };
+  }
+
+  /**
+   * Reassign a specific timeslot's subject to another subject code
+   */
+  async reassignTimeSlotSubject(studentId, { day, startTime, endTime, toSubjectCode, fromSubjectCode }) {
+    if (!day || !startTime || !endTime || !toSubjectCode) {
+      throw new Error('Missing fields: day, startTime, endTime, toSubjectCode are required');
+    }
+
+    const student = await Student.findById(studentId);
+    if (!student) throw new Error('Student not found');
+
+    const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+    if (!schedule) throw new Error('Schedule not found');
+
+    const toSubj = schedule.subjects.find(s => s.code.toLowerCase() === toSubjectCode.toLowerCase());
+    if (!toSubj) throw new Error(`Target subject ${toSubjectCode} not found in schedule`);
+
+    const fromSubj = fromSubjectCode ? schedule.subjects.find(s => s.code.toLowerCase() === fromSubjectCode.toLowerCase()) : null;
+
+    // Update matching slots
+    let changed = 0;
+    for (const slot of schedule.timeSlots) {
+      if (slot.day === day && slot.startTime === startTime && slot.endTime === endTime) {
+        if (!fromSubj || slot.subject.toString() === fromSubj._id.toString()) {
+          slot.subject = toSubj._id;
+          changed++;
+        }
+      }
+    }
+    await schedule.save();
+
+    // Optionally migrate existing attendance records for those timeslots
+    let migrated = 0;
+    const timeSlotKey = `${startTime}-${endTime}`;
+    const filter = { phoneNumber: student.phoneNumber, timeSlot: timeSlotKey };
+    if (fromSubjectCode) filter.subjectCode = fromSubjectCode;
+
+    const update = { $set: { subjectCode: toSubj.code, subjectName: toSubj.name } };
+    const res = await AttendanceRecord.updateMany(filter, update);
+    migrated = res.modifiedCount || 0;
+
+    this.clearCache(studentId, student.phoneNumber);
+    return { changedSlots: changed, migratedRecords: migrated, to: { code: toSubj.code, name: toSubj.name } };
+  }
+
+  /**
+   * Modify subject wrapper: decide rename vs timeslot reassignment
+   */
+  async modifySubject(studentId, payload) {
+    if (payload.oldSubjectCode || payload.newSubjectName) {
+      return this.renameSubject(studentId, {
+        oldSubjectCode: payload.oldSubjectCode,
+        newSubjectCode: payload.newSubjectCode,
+        newSubjectName: payload.newSubjectName
+      });
+    }
+    if (payload.day && payload.startTime && payload.endTime && payload.newSubjectCode) {
+      return this.reassignTimeSlotSubject(studentId, {
+        day: payload.day,
+        startTime: payload.startTime,
+        endTime: payload.endTime,
+        toSubjectCode: payload.newSubjectCode,
+        fromSubjectCode: payload.fromSubjectCode
+      });
+    }
+    throw new Error('Insufficient data to modify subject');
+  }
+
+  /**
+   * Modify attendance for a given subject/date by updating all matching slots
+   */
+  async modifyAttendance(studentId, { subjectCode, date, status }) {
+    try {
+      if (!subjectCode || !date || !status) {
+        throw new Error('Missing subjectCode, date or status');
+      }
+
+      const student = await Student.findById(studentId);
+      if (!student) throw new Error('Student not found');
+
+      // Need full schedule doc (no lean) to access subdocument _id
+      const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+      if (!schedule) throw new Error('Schedule not found');
+
+      // Resolve date robustly
+      const parsed = moment(date, [moment.ISO_8601, 'YYYY-MM-DD', 'DD-MM-YYYY', 'DD/MM/YYYY', 'MMM D, YYYY', 'D MMM YYYY'], true);
+      const dateObj = parsed.isValid() ? parsed.clone().startOf('day') : moment(new Date(date)).startOf('day');
+      if (!dateObj.isValid()) throw new Error('Invalid date format');
+
+      // Find subject by code (normalize spaces/case)
+      const subj = schedule.subjects.find(s => 
+        s.code.toLowerCase() === subjectCode.toLowerCase() ||
+        s.code.replace(/\s+/g, '').toLowerCase() === subjectCode.replace(/\s+/g, '').toLowerCase()
+      );
+      if (!subj) throw new Error(`Subject ${subjectCode} not found in schedule`);
+
+      const dayOfWeek = dateObj.format('dddd');
+      const daySlots = schedule.timeSlots.filter(slot => slot.day === dayOfWeek && slot.subject.toString() === subj._id.toString());
+      if (daySlots.length === 0) throw new Error(`${subj.code} is not scheduled on ${dayOfWeek}`);
+
+      const phoneNumber = student.phoneNumber;
+      const start = dateObj.toDate();
+      const end = dateObj.clone().add(1, 'day').toDate();
+      let updated = 0;
+
+      for (const slot of daySlots) {
+        const timeSlotKey = `${slot.startTime}-${slot.endTime}`;
+        await AttendanceRecord.findOneAndUpdate(
+          {
+            phoneNumber,
+            subjectCode: subj.code,
+            date: { $gte: start, $lt: end },
+            timeSlot: timeSlotKey
+          },
+          {
+            $set: {
+              phoneNumber,
+              subjectCode: subj.code,
+              subjectName: subj.name,
+              date: start,
+              status: status.toUpperCase(),
+              timeSlot: timeSlotKey,
+              notes: 'Modified by student'
+            }
+          },
+          { upsert: true, new: true }
+        );
+        updated++;
+      }
+
+      // Clear cache so subsequent reads are fresh
+      this.clearCache(studentId, phoneNumber);
+
+      return { updated, subject: subj.code, day: dayOfWeek, date: dateObj.format('YYYY-MM-DD') };
+    } catch (error) {
+      console.error('❌ Error modifying attendance:', error);
       throw error;
     }
   }

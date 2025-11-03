@@ -5,9 +5,10 @@
   "main": "index.js",
   "scripts": {
     "test": "node test_bot.js",
-    "start": "node app_v2.js",
-    "start:old": "node app_production.js",
-    "dev": "nodemon app_v2.js",
+    "start": "node app_production.js",
+    "start:prod": "node app_production.js",
+    "start:v2": "node app_v2.js",
+    "dev": "nodemon app_production.js",
     "app": "node app_Version2.js",
     "local": "node start.js"
   },

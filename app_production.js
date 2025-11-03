@@ -290,6 +290,10 @@ async function handleTextMessage(student, phoneNumber, text, messageId) {
         await handleModifyAttendance(student, phoneNumber, aiResponse);
         break;
 
+      case 'modify_subject':
+        await handleModifySubject(student, phoneNumber, aiResponse);
+        break;
+
       default:
         await whatsappService.sendMessage(phoneNumber, aiResponse.message);
     }
@@ -576,43 +580,42 @@ async function handleViewAttendanceDetails(student, phoneNumber, aiResponse) {
       return;
     }
     
-    // Count total time slots for this subject
+    // Count total time slots for this subject (informational only)
     const totalSlots = schedule.timeSlots.filter(slot => 
       slot.subject.toString() === subject._id.toString()
     ).length;
-    
-    // Get attendance records for this subject
+
+    // Get attendance records for this subject (only PRESENT/ABSENT meaningful for stats)
     const AttendanceRecord = require('./models/models_Attendance_Version2');
     const records = await AttendanceRecord.find({ 
       phoneNumber: student.phoneNumber,
-      subjectCode: subject.code
+      subjectCode: subject.code,
+      status: { $in: ['PRESENT', 'ABSENT'] }
     }).sort({ date: 1 });
-    
-    // Group by status
+
     const present = records.filter(r => r.status === 'PRESENT');
-    const explicitAbsent = records.filter(r => r.status === 'ABSENT');
-    
-    // Calculate actual absent: Total scheduled classes - Present classes
-    const actualAbsent = totalSlots - present.length;
-    
-    const percentage = totalSlots > 0 ? ((present.length / totalSlots) * 100).toFixed(1) : 0;
-    
+    const absent = records.filter(r => r.status === 'ABSENT');
+    const totalRecorded = present.length + absent.length;
+
+    // Align percentage with summary: use recorded entries only
+    const percentage = totalRecorded > 0 ? ((present.length / totalRecorded) * 100).toFixed(1) : 0;
+
     let message = `📊 *${subject.code} - ${subject.name}*\n\n`;
-    message += `✅ Present: ${present.length}/${totalSlots} (${percentage}%)\n`;
-    message += `❌ Absent/Not Marked: ${actualAbsent}\n`;
-    message += `📚 Total Classes in Schedule: ${totalSlots}\n\n`;
+    message += `✅ Present: ${present.length}/${totalRecorded} (${percentage}%)\n`;
+    message += `🧾 Recorded entries: ${totalRecorded} (P:${present.length}, A:${absent.length})\n`;
+    message += `📚 Scheduled classes (info): ${totalSlots}\n\n`;
     
-    if (records.length === 0) {
+    if (totalRecorded === 0) {
       message += `⚠️ *No attendance marked yet*\n`;
-      message += `All ${totalSlots} classes count as absent until marked.\n\n`;
+      message += `Mark your classes to build your recorded summary.\n\n`;
       message += `💡 Say "I attended all classes today" to mark attendance.`;
-    } else if (actualAbsent > 0) {
+    } else if (absent.length > 0) {
       message += `*Classes Not Attended:*\n`;
       
       // Show explicitly marked absent classes
-      if (explicitAbsent.length > 0) {
+      if (absent.length > 0) {
         message += `\n📍 *Marked as Absent:*\n`;
-        explicitAbsent.forEach(r => {
+        absent.forEach(r => {
           const date = new Date(r.date).toLocaleDateString('en-US', { 
             month: 'short', 
             day: 'numeric',
@@ -621,13 +624,6 @@ async function handleViewAttendanceDetails(student, phoneNumber, aiResponse) {
           const time = r.timeSlot !== 'general' ? ` (${r.timeSlot})` : '';
           message += `❌ ${date}${time}\n`;
         });
-      }
-      
-      // Calculate unrecorded classes
-      const unrecorded = actualAbsent - explicitAbsent.length;
-      if (unrecorded > 0) {
-        message += `\n⚠️ *${unrecorded} class${unrecorded > 1 ? 'es' : ''} not recorded*\n`;
-        message += `(These count as absent for attendance percentage)\n`;
       }
       message += `\n`;
     } else if (present.length > 0) {
@@ -666,74 +662,11 @@ async function handleModifyAttendance(student, phoneNumber, aiResponse) {
       return;
     }
     
-    const AttendanceRecord = require('./models/models_Attendance_Version2');
-    const Schedule = require('./models/models_Schedule_Version2');
-    
-    // Get the schedule to find subject details
-    const schedule = await Schedule.findOne({ student: student._id }).sort({ createdAt: -1 });
-    const subject = schedule.subjects.find(s => 
-      s.code.toLowerCase() === subjectCode.toLowerCase()
-    );
-    
-    if (!subject) {
-      await whatsappService.sendMessage(
-        phoneNumber,
-        `❌ Subject ${subjectCode} not found in your schedule.`
-      );
-      return;
-    }
-    
-    // Parse date
-    const targetDate = new Date(date);
-    const dayOfWeek = targetDate.toLocaleDateString('en-US', { weekday: 'long' });
-    
-    // Get time slots for this subject on this day
-    const daySlots = schedule.timeSlots.filter(slot => 
-      slot.day === dayOfWeek &&
-      slot.subject.toString() === subject._id.toString()
-    );
-    
-    if (daySlots.length === 0) {
-      await whatsappService.sendMessage(
-        phoneNumber,
-        `❌ ${subjectCode} is not scheduled on ${dayOfWeek}s.`
-      );
-      return;
-    }
-    
-    // Update or create attendance for each slot
-    let updated = 0;
-    for (const slot of daySlots) {
-      const timeSlotKey = `${slot.startTime}-${slot.endTime}`;
-      
-      const record = await AttendanceRecord.findOneAndUpdate(
-        {
-          phoneNumber: student.phoneNumber,
-          subjectCode: subject.code,
-          date: {
-            $gte: new Date(targetDate.setHours(0, 0, 0, 0)),
-            $lt: new Date(targetDate.setHours(23, 59, 59, 999))
-          },
-          timeSlot: timeSlotKey
-        },
-        {
-          phoneNumber: student.phoneNumber,
-          subjectCode: subject.code,
-          subjectName: subject.name,
-          date: targetDate,
-          status: status.toUpperCase(),
-          timeSlot: timeSlotKey,
-          notes: 'Modified by student'
-        },
-        { upsert: true, new: true }
-      );
-      
-      updated++;
-    }
-    
+    const result = await attendanceService.modifyAttendance(student._id, { subjectCode, date, status });
+
     await whatsappService.sendMessage(
       phoneNumber,
-      `✅ Updated ${updated} attendance record(s) for ${subjectCode} on ${dayOfWeek}, ${targetDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}\n\n` +
+      `✅ Updated ${result.updated} attendance record(s) for ${result.subject} on ${result.day}, ${result.date}\n\n` +
       `Status: ${status.toUpperCase()}\n\n` +
       `💡 Check your summary with "show my attendance"`
     );
@@ -743,6 +676,66 @@ async function handleModifyAttendance(student, phoneNumber, aiResponse) {
     await whatsappService.sendMessage(
       phoneNumber,
       '😔 Sorry, I had trouble modifying attendance. Please try again!'
+    );
+  }
+}
+
+/**
+ * Handle subject corrections (rename or timeslot remap)
+ */
+async function handleModifySubject(student, phoneNumber, aiResponse) {
+  try {
+    const { oldSubjectCode, newSubjectCode, newSubjectName, day, startTime, endTime, fromSubjectCode } = aiResponse;
+
+    // Decide operation type
+    const isRename = !!(oldSubjectCode && (newSubjectCode || newSubjectName));
+    const isRemap = !!(day && startTime && endTime && newSubjectCode);
+
+    if (!isRename && !isRemap) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        '❓ Please specify what to change:\n\n' +
+        '• Rename a subject: "PC209 should be PC-209" or "Rename PC-209 to Operating Systems"\n' +
+        '• Fix a timeslot: "Tuesday 10:00-11:00 is MA101 (not PH101)"\n'
+      );
+      return;
+    }
+
+    let result;
+    if (isRename) {
+      result = await attendanceService.modifySubject(student._id, {
+        oldSubjectCode,
+        newSubjectCode,
+        newSubjectName
+      });
+
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `✅ Updated subject\nFrom: ${result.from.code} - ${result.from.name}\nTo:   ${result.to.code} - ${result.to.name}\nMigrated records: ${result.migrated}`
+      );
+      return;
+    }
+
+    if (isRemap) {
+      result = await attendanceService.modifySubject(student._id, {
+        day,
+        startTime,
+        endTime,
+        newSubjectCode,
+        fromSubjectCode
+      });
+
+      await whatsappService.sendMessage(
+        phoneNumber,
+        `✅ Reassigned ${day} ${startTime}-${endTime} to ${result.to.code} - ${result.to.name}\nChanged slots: ${result.changedSlots}\nMigrated attendance records: ${result.migratedRecords}`
+      );
+      return;
+    }
+  } catch (error) {
+    console.error('Error in handleModifySubject:', error);
+    await whatsappService.sendMessage(
+      phoneNumber,
+      `😔 Sorry, I couldn't modify the subject: ${error.message}`
     );
   }
 }

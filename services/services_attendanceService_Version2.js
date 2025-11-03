@@ -275,60 +275,129 @@ class AttendanceService {
         };
       }
       
-      // Get attendance records using phone number
-      const records = await AttendanceRecord.find({ phoneNumber: phoneNumber });
-      
-      // Calculate overall attendance
+      // Get attendance records using phone number (only PRESENT/ABSENT for summary)
+      const records = await AttendanceRecord.find({ 
+        phoneNumber: phoneNumber,
+        status: { $in: ['PRESENT', 'ABSENT'] }
+      });
+
+      // Calculate subject-wise summary based on recorded data
       const subjectsData = [];
-      let totalClasses = 0;
-      let totalPresent = 0;
-      
+      let totalRecordedAll = 0;
+      let totalPresentAll = 0;
+
       for (const subject of schedule.subjects) {
-        // Count total time slots for this subject in schedule
-        const totalSlotsInSchedule = schedule.timeSlots.filter(slot => 
-          slot.subject.toString() === subject._id.toString()
-        ).length;
-        
-        // Get attendance records for this subject
-        const subjectRecords = records.filter(r => 
-          r.subjectCode === subject.code && 
-          r.status !== 'CANCELLED' && 
-          r.status !== 'HOLIDAY'
-        );
-        
+        const subjectRecords = records.filter(r => r.subjectCode === subject.code);
         const presentCount = subjectRecords.filter(r => r.status === 'PRESENT').length;
         const absentCount = subjectRecords.filter(r => r.status === 'ABSENT').length;
         const totalRecorded = presentCount + absentCount;
-        
-        // Use totalSlotsInSchedule as the total classes
-        const percentage = totalSlotsInSchedule > 0 ? (presentCount / totalSlotsInSchedule * 100).toFixed(1) : 'N/A';
-        
+
+        const percentage = totalRecorded > 0 
+          ? (presentCount / totalRecorded * 100).toFixed(1) 
+          : '0.0';
+
         subjectsData.push({
           code: subject.code,
           name: subject.name,
           present: presentCount,
-          total: totalSlotsInSchedule,
-          percentage: percentage
+          absent: absentCount,
+          total: totalRecorded,
+          percentage
         });
-        
-        totalClasses += totalSlotsInSchedule;
-        totalPresent += presentCount;
+
+        totalRecordedAll += totalRecorded;
+        totalPresentAll += presentCount;
       }
-      
-      const overallPercentage = totalClasses > 0 ? 
-        (totalPresent / totalClasses * 100).toFixed(2) : 
-        'N/A';
-      
+
+      const overallPercentage = totalRecordedAll > 0 
+        ? (totalPresentAll / totalRecordedAll * 100).toFixed(1)
+        : '0.0';
+
       return {
         overall: {
-          present: totalPresent,
-          total: totalClasses,
+          present: totalPresentAll,
+          total: totalRecordedAll,
           percentage: overallPercentage
         },
         subjects: subjectsData
       };
     } catch (error) {
       console.error('Error getting attendance summary:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Modify attendance for a given subject and date
+   */
+  async modifyAttendance(studentId, modifyData) {
+    try {
+      const { subjectCode, date, status } = modifyData;
+      if (!subjectCode || !date || !status) {
+        throw new Error('Missing subjectCode, date or status');
+      }
+
+      const student = await Student.findById(studentId);
+      if (!student) throw new Error('Student not found');
+
+      const schedule = await Schedule.findOne({ student: studentId }).sort({ createdAt: -1 });
+      if (!schedule) throw new Error('Schedule not found');
+
+      const targetDate = moment(date, [moment.ISO_8601, 'YYYY-MM-DD', 'DD-MM-YYYY', 'DD/MM/YYYY', 'MMM D, YYYY', 'D MMM YYYY'], true);
+      const dateObj = targetDate.isValid() ? targetDate.clone().startOf('day') : moment(new Date(date)).startOf('day');
+      if (!dateObj.isValid()) throw new Error('Invalid date format');
+
+      // Find the subject in schedule
+      const subject = schedule.subjects.find(s => 
+        s.code.toLowerCase() === subjectCode.toLowerCase() ||
+        s.code.replace(/\s+/g, '').toLowerCase() === subjectCode.replace(/\s+/g, '').toLowerCase()
+      );
+      if (!subject) throw new Error(`Subject ${subjectCode} not found in schedule`);
+
+      const dayOfWeek = dateObj.format('dddd');
+
+      // Get all slots for this subject on that weekday
+      const daySlots = schedule.timeSlots.filter(slot => 
+        slot.day === dayOfWeek && slot.subject.toString() === subject._id.toString()
+      );
+
+      if (daySlots.length === 0) {
+        throw new Error(`${subject.code} is not scheduled on ${dayOfWeek}`);
+      }
+
+      const phoneNumber = student.phoneNumber;
+      const updates = [];
+      const dayStart = dateObj.toDate();
+      const dayEnd = dateObj.clone().add(1, 'day').toDate();
+
+      for (const slot of daySlots) {
+        const timeSlotKey = `${slot.startTime}-${slot.endTime}`;
+        const updated = await AttendanceRecord.findOneAndUpdate(
+          {
+            phoneNumber,
+            subjectCode: subject.code,
+            date: { $gte: dayStart, $lt: dayEnd },
+            timeSlot: timeSlotKey
+          },
+          {
+            $set: {
+              phoneNumber,
+              subjectCode: subject.code,
+              subjectName: subject.name,
+              date: dayStart,
+              status: status.toUpperCase(),
+              timeSlot: timeSlotKey,
+              notes: 'Modified by student'
+            }
+          },
+          { upsert: true, new: true }
+        );
+        updates.push(updated);
+      }
+
+      return { updated: updates.length, subject: subject.code, day: dayOfWeek, date: dateObj.format('YYYY-MM-DD') };
+    } catch (error) {
+      console.error('Error modifying attendance:', error);
       throw error;
     }
   }

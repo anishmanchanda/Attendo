@@ -74,6 +74,40 @@ async function handleSummaryRequest(student, phoneNumber, whatsappService) {
 }
 
 /**
+ * Handle modifying attendance based on AI extraction
+ */
+async function handleModifyAttendance(student, phoneNumber, aiResponse, whatsappService) {
+  try {
+    const { subjectCode, date, status } = aiResponse;
+
+    if (!subjectCode || !date || !status) {
+      await whatsappService.sendMessage(
+        phoneNumber,
+        '❓ Please specify:\n• Subject code (e.g., PC-209)\n• Date (YYYY-MM-DD or natural language)\n• Status (present or absent)\n\nExample: "Mark me present for PC-209 on 2025-10-27"'
+      );
+      return;
+    }
+
+    const result = await attendanceService.modifyAttendance(student._id, {
+      subjectCode,
+      date,
+      status
+    });
+
+    await whatsappService.sendMessage(
+      phoneNumber,
+      `✅ Updated ${result.updated} record(s) for ${result.subject} on ${result.day}, ${result.date}\nStatus: ${status.toUpperCase()}\n\n💡 You can check with "show my attendance"`
+    );
+  } catch (error) {
+    console.error('Error in handleModifyAttendance:', error);
+    await whatsappService.sendMessage(
+      phoneNumber,
+      `😔 Couldn't modify attendance: ${error.message}`
+    );
+  }
+}
+
+/**
  * Handle viewing schedule for a specific day
  */
 async function handleViewSchedule(student, phoneNumber, aiResponse, whatsappService) {
@@ -152,5 +186,6 @@ async function handleViewSchedule(student, phoneNumber, aiResponse, whatsappServ
 module.exports = {
   handleAttendanceRecording,
   handleSummaryRequest,
-  handleViewSchedule
+  handleViewSchedule,
+  handleModifyAttendance
 };
