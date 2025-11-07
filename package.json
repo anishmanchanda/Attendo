@@ -2,15 +2,11 @@
   "name": "attendance-chatbot",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "app_production.js",
   "scripts": {
-    "test": "node test_bot.js",
-    "start": "node app_production.js",
-    "start:prod": "node app_production.js",
-    "start:v2": "node app_v2.js",
-    "dev": "nodemon app_production.js",
-    "app": "node app_Version2.js",
-    "local": "node start.js"
+  "start": "node app_production.js",
+  "start:prod": "node app_production.js",
+  "dev": "nodemon app_production.js"
   },
   "engines": {
     "node": ">=18.0.0",
